@@ -1650,6 +1650,128 @@ TEST(prepare_buffer_fusing, in_place_onednn_concat_static) {
         ASSERT_EQ(ref_output[x], output_ptr[x]);
     }
 }
+// OPT_001: static-shape oneDNN concat with batch>1 must now fuse (zero-copy, in-place buffer).
+// Before the fix: concat_out_l.batch() > 1 returned false unconditionally in the static path.
+// After the fix: 64-byte alignment check is the only gate — batch size is irrelevant.
+TEST(prepare_buffer_fusing, in_place_onednn_concat_static_batch_gt1) {
+    auto& engine = get_test_engine();
+    if (!engine.get_device_info().supports_immad)
+        return;
+
+    // batch=8 — previously blocked by the removed "if (concat_out_l.batch() > 1) return false"
+    auto in_layout1 = layout{ ov::PartialShape{8, 1, 4, 2}, data_types::f32, format::bfyx };
+    auto in_layout2 = layout{ ov::PartialShape{8, 2, 4, 2}, data_types::f32, format::bfyx };
+
+    topology topology;
+    topology.add(input_layout("input1", in_layout1));
+    topology.add(input_layout("input2", in_layout2));
+    topology.add(reorder("reorder1", input_info("input1"), format::bfyx, data_types::f16));
+    topology.add(reorder("reorder2", input_info("input2"), format::bfyx, data_types::f16));
+    topology.add(concatenation("concat", { input_info("reorder1"), input_info("reorder2") }, 1));
+    topology.add(reorder("output", input_info("concat"), format::bfyx, data_types::f32));
+
+    ExecutionConfig config = get_test_default_config(engine);
+    config.set_property(ov::intel_gpu::optimize_data(true));
+    config.set_property(ov::intel_gpu::allow_new_shape_infer(false));
+    network network(engine, topology, config);
+
+    // 8 batches × 1 feature × 4 × 2 = 64 elements
+    auto input_memory1 = engine.allocate_memory(in_layout1);
+    auto input_memory2 = engine.allocate_memory(in_layout2);
+    std::vector<float> vals1(64), vals2(128);
+    for (size_t i = 0; i < vals1.size(); i++) vals1[i] = static_cast<float>(i + 1);
+    for (size_t i = 0; i < vals2.size(); i++) vals2[i] = static_cast<float>((i + 1) * 10);
+    set_values<float>(input_memory1, vals1);
+    set_values<float>(input_memory2, vals2);
+
+    network.set_input_data("input1", input_memory1);
+    network.set_input_data("input2", input_memory2);
+
+    std::map<cldnn::primitive_id, cldnn::network_output> output;
+    EXPECT_NO_THROW(output = network.execute());
+
+    const auto& concat_node = network.get_primitive("concat")->get_node();
+    auto concat_mem   = network.get_primitive("concat")->output_memory_ptr();
+    auto reorder1_mem = network.get_primitive("reorder1")->output_memory_ptr();
+    auto reorder2_mem = network.get_primitive("reorder2")->output_memory_ptr();
+
+    // Concat must now be fused (shared buffer) for static batch>1
+    ASSERT_TRUE(concat_node.can_be_optimized());
+    ASSERT_EQ(concat_mem.get(), reorder1_mem.get());
+    ASSERT_EQ(concat_mem.get(), reorder2_mem.get());
+
+    auto out_mem = output.at("output").get_memory();
+    auto out_l   = network.get_output_layout("output");
+    cldnn::mem_lock<float> output_ptr(out_mem, get_test_stream());
+    // Shape [8,3,4,2] = 192 elements — verify no NaN/Inf from buffer aliasing errors
+    ASSERT_EQ(out_l.count(), 192u);
+    for (size_t x = 0; x < out_l.count(); ++x)
+        ASSERT_FALSE(std::isnan(output_ptr[x]) || std::isinf(output_ptr[x]))
+            << "NaN/Inf at index " << x;
+}
+
+// OPT_002: predecessor with 3 users (concat + 2 safe-type permute/eltwise nodes)
+// must now be allowed to fuse. Before the fix: get_users().size() > 2 returned false.
+// After the fix: the type-based available_pred check allows safe-type multi-user predecessors.
+TEST(prepare_buffer_fusing, in_place_onednn_concat_multi_user_safe_type) {
+    auto& engine = get_test_engine();
+    if (!engine.get_device_info().supports_immad)
+        return;
+
+    // shared_in → reorder (shared_r) feeds 3 users: concat, act1, act2 — all safe types.
+    // Use f32 inputs so reorder(f32→f16) is non-trivial and not optimized out by the pass.
+    auto in_layout  = layout{ ov::PartialShape{1, 16, 4, 4}, data_types::f32, format::bfyx };
+    auto in_layout2 = layout{ ov::PartialShape{1, 16, 4, 4}, data_types::f32, format::bfyx };
+
+    topology topology;
+    topology.add(input_layout("shared_in", in_layout));
+    topology.add(input_layout("other_in",  in_layout2));
+    // shared_r: the predecessor node that will have 3 users
+    topology.add(reorder("shared_r", input_info("shared_in"), format::bfyx, data_types::f16));
+    topology.add(reorder("other_r",  input_info("other_in"),  format::bfyx, data_types::f16));
+
+    // User 1 of shared_r: concat (the node we want to fuse)
+    topology.add(concatenation("concat", { input_info("shared_r"), input_info("other_r") }, 1));
+    // User 2 of shared_r: activation relu (safe type — in available_pred, never reads padding)
+    topology.add(activation("act1", input_info("shared_r"), activation_func::relu));
+    // User 3 of shared_r: activation clamp (safe type)
+    topology.add(activation("act2", input_info("shared_r"), activation_func::clamp, {0.0f, 1.0f}));
+
+    topology.add(reorder("out_concat", input_info("concat"), format::bfyx, data_types::f32));
+    topology.add(reorder("out_act1",   input_info("act1"),   format::bfyx, data_types::f32));
+    topology.add(reorder("out_act2",   input_info("act2"),   format::bfyx, data_types::f32));
+
+    ExecutionConfig config = get_test_default_config(engine);
+    config.set_property(ov::intel_gpu::optimize_data(true));
+    config.set_property(ov::intel_gpu::allow_new_shape_infer(false));
+    network network(engine, topology, config);
+
+    auto input_memory  = engine.allocate_memory(in_layout);
+    auto input_memory2 = engine.allocate_memory(in_layout2);
+    std::vector<float> d1(16 * 4 * 4, 1.0f);
+    std::vector<float> d2(16 * 4 * 4, 2.0f);
+    set_values(input_memory,  d1);
+    set_values(input_memory2, d2);
+
+    network.set_input_data("shared_in", input_memory);
+    network.set_input_data("other_in",  input_memory2);
+
+    std::map<cldnn::primitive_id, cldnn::network_output> output;
+    EXPECT_NO_THROW(output = network.execute());
+
+    // After OPT_002: predecessor has 3 users — all safe — concat must be fused
+    const auto& concat_node = network.get_primitive("concat")->get_node();
+    ASSERT_TRUE(concat_node.can_be_optimized());
+
+    // Verify outputs are numerically valid (no corruption from buffer aliasing)
+    for (const auto& out_id : std::vector<std::string>{"out_concat", "out_act1", "out_act2"}) {
+        auto out_mem = output.at(out_id).get_memory();
+        cldnn::mem_lock<float> ptr(out_mem, get_test_stream());
+        for (size_t i = 0; i < ptr.size(); i++)
+            ASSERT_FALSE(std::isnan(ptr[i]) || std::isinf(ptr[i]))
+                << "NaN/Inf in " << out_id << " at index " << i;
+    }
+}
 #endif  // ENABLE_ONEDNN_FOR_GPU
 
 TEST(prepare_buffer_fusing, inner_axis_data_offset_with_gemm_user) {

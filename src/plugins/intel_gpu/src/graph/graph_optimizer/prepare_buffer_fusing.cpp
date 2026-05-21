@@ -148,9 +148,18 @@ bool concat_in_place_optimization::match(const program_node& concat_node,
         // TODO: handle optimized reshape
         if (pred.first->is_type<reshape>() && pred.first->can_be_optimized())
             return false;
-        // TODO: Investigate if this condition is needed
-        if (pred.first->get_users().size() > 2)
-            return false;
+        // Allow implicit concat when predecessor has multiple users, as long as all non-concat users
+        // are node types whose kernels correctly handle inputs with padding on the concat axis.
+        // Types in available_pred (convolution, pooling, activation, eltwise, etc.) iterate only over
+        // valid tensor dimensions and never read into padded regions.
+        if (pred.first->get_users().size() > 2) {
+            for (const auto& user : pred.first->get_users()) {
+                if (user->is_type<concatenation>())
+                    continue;
+                if (!available_pred(*user))
+                    return false;
+            }
+        }
 
        // Check that input isn't optimized out concatenation along different axis.
         if (pred.first->is_type<concatenation>() && pred.first->can_be_optimized()) {
@@ -229,14 +238,15 @@ bool concat_in_place_optimization::match(const program_node& concat_node,
         }
         if (!concat_node.is_dynamic() || is_runtime) {
             lower_padd_in_axis += pred_params[idx].get_output_layout().get_tensor().sizes(def_fmt)[concat_axis];
-            // Accumulates byte offset for onednn 64-byte alignment. The assumption here is that onednn will support batch 1 case.
+            // Accumulates byte offset for onednn 64-byte alignment check.
             onednn_byte_offset += pred_l.bytes_count();
         }
 
         idx++;
     }
 
-    // Implicit concat for onednn only when use_usm and batch 1.
+    // Implicit concat for onednn only when use_usm.
+    // The 64-byte alignment check above (line ~204) ensures correctness for all batch sizes.
     if (is_onednn_impl) {
         bool use_usm = concat_node.get_program().get_engine().use_unified_shared_memory();
         const layout& concat_out_l = concat_params.get_output_layout();
@@ -246,7 +256,12 @@ bool concat_in_place_optimization::match(const program_node& concat_node,
             // Return true in build time, it will be checked again in runtime
             return true;
         } else {
-            if (concat_out_l.batch() > 1)
+            // Batch-axis (axis=0) concat with batch>1 is not supported for oneDNN implicit fusing:
+            // block formats (b_fs_yx_fsv16 etc.) are not contiguous along the batch axis, so
+            // zero-copy in-place aliasing would produce incorrect results.
+            // Feature-axis (axis=1) concat with batch>1 is safe — the 64-byte alignment check
+            // above (line ~204) is the actual correctness gate for non-batch axes.
+            if (concat_axis_index == 0 && concat_out_l.batch() > 1)
                 return false;
             const auto& dims_order = concat_out_l.format.dims_order();
             for (auto dim : dims_order) {

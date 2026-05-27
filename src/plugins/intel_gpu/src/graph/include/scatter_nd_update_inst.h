@@ -37,6 +37,7 @@ public:
 public:
     typed_primitive_inst(network& network, scatter_nd_update_node const& desc);
     void update_output_memory() override;
+    bool try_update_in_place_output_memory();
 
 private:
     void on_execute() override;

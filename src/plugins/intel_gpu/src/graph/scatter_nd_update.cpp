@@ -14,6 +14,23 @@
 namespace cldnn {
 GPU_DEFINE_PRIMITIVE_TYPE_ID(scatter_nd_update)
 
+namespace {
+bool can_update_in_place(const scatter_nd_update_node& node, const kernel_impl_params& impl_params) {
+    if (node.is_dynamic() || node.has_fused_primitives())
+        return false;
+
+    if (node.is_output() && node.get_dependency(0).is_input())
+        return false;
+
+    if (impl_params.get_input_layout(0).format != impl_params.get_output_layout().format ||
+        impl_params.get_input_layout(0).data_type != impl_params.get_output_layout().data_type)
+        return false;
+
+    auto& input = node.get_dependency(0);
+    return !input.is_input() && !input.is_constant() && input.get_users().size() == 1;
+}
+}  // namespace
+
 layout scatter_nd_update_inst::calc_output_layout(scatter_nd_update_node const& node, kernel_impl_params const& impl_param) {
     auto input_layout = impl_param.get_input_layout();
 
@@ -77,22 +94,31 @@ void scatter_nd_update_inst::update_output_memory() {
     if (!can_be_optimized() || _impl_params->is_dynamic())
         return;
 
+    try_update_in_place_output_memory();
+}
+
+bool scatter_nd_update_inst::try_update_in_place_output_memory() {
+    if ((!can_be_optimized() && !can_update_in_place(get_node().as<scatter_nd_update>(), *_impl_params)) ||
+        _impl_params->is_dynamic())
+        return false;
+
     if (_outputs.size() > 0 && static_cast<bool>(_outputs[0])
         && _network.get_engine().is_the_same_buffer(output_memory(), input_memory()))
-        return;
+        return false;
 
     build_deps();
 
     if (input_memory_ptr() == nullptr)
-        return;
+        return false;
 
     // Can_be_optimized nodes are allocating from memory_pool too. In this case,
     // we need release the legacy output memory from memory pool explicitly.
-    if (static_cast<bool>(_outputs[0]) &&
+    if (_outputs.size() > 0 && static_cast<bool>(_outputs[0]) &&
         get_node().get_program().get_config().get_enable_memory_pool()) {
         _network.get_memory_pool().release_memory(_outputs[0].get(), get_node().get_unique_id(), get_node().id(), _network.get_id());
     }
     _outputs = {_network.get_engine().reinterpret_buffer(input_memory(), _impl_params->get_output_layout())};
     _mem_allocated = false;
+    return true;
 }
 }  // namespace cldnn

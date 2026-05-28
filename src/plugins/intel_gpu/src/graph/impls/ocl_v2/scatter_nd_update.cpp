@@ -315,13 +315,12 @@ public:
             return stream.aggregate_events(events, events.size() > 1, instance.is_output());
         }
 
-        const auto updated_output = static_cast<cldnn::scatter_nd_update_inst&>(instance).try_update_in_place_output_memory();
+        // Runtime in-place aliasing disabled: the memory pool may reclaim the
+        // input buffer before downstream consumers finish reading scatter's output,
+        // causing non-deterministic corruption. Additionally, for scatter chains
+        // whose root input derives from a constant, in-place modification corrupts
+        // the constant buffer across inferences. Use standard COPY_ALL + UPDATE.
         update_rt_params(instance);
-        if (updated_output) {
-            for (auto& stage : _stages) {
-                stage->kd.need_args_update = true;
-            }
-        }
 
         std::vector<size_t> exec_stages;
         if (!instance.get_network().get_engine().is_the_same_buffer(instance.output_memory(), instance.input_memory())) {
@@ -341,7 +340,7 @@ public:
         }
 
         return stream.aggregate_events(all_events, true, instance.is_output());
-    }
+    };
 };
 
 }  // namespace

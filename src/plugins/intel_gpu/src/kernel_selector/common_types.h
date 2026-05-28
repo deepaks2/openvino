@@ -52,6 +52,7 @@ enum class KernelType {
     BUCKETIZE,
     GEMM,
     GRID_SAMPLE,
+    GROUP_CORRELATION,
     CONTRACT,
     ONE_HOT,
     GATHER,

@@ -43,7 +43,7 @@ namespace detail {
 
 attach_group_correlation_impl::attach_group_correlation_impl() {
     auto types = {data_types::f16, data_types::f32};
-    auto formats = {format::bfzyx};  // output is bfzyx (N, G, D, H, W)
+    auto formats = {format::bfzyx, format::bzyxf};  // support both output formats
 
     implementation_map<group_correlation>::add(impl_types::ocl,
                                                 typed_primitive_impl_ocl<group_correlation>::create<group_correlation_impl>,

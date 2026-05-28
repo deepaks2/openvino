@@ -9,6 +9,7 @@
 #include "permute_kernel_bfzyx_to_bfyxz.h"
 #include "permute_kernel_f_y_axes.h"
 #include "permute_kernel_bzyxf_to_bfyx.h"
+#include "permute_kernel_bfyx_to_bfsv16.h"
 
 namespace kernel_selector {
 
@@ -19,6 +20,7 @@ permute_kernel_selector::permute_kernel_selector() {
     Attach<PermuteKernel_bfzyx_to_bfyxz>();
     Attach<PermuteKernel_f_y_axes>();
     Attach<PermuteKernel_bzyxf_to_bfyx>();
+    Attach<PermuteKernel_bfyx_to_bfsv16>();
 }
 
 KernelsData permute_kernel_selector::GetBestKernels(const Params& params) const {

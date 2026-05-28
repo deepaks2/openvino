@@ -32,7 +32,7 @@ layout group_correlation_inst::calc_output_layout(const group_correlation_node& 
                             static_cast<int>(H),
                             static_cast<int>(prim->max_disparity));
 
-    return {left_layout.data_type, format::bfzyx, out_tensor};
+    return {left_layout.data_type, format::bzyxf, out_tensor};
 }
 
 template <typename ShapeType>
@@ -50,7 +50,7 @@ std::vector<layout> group_correlation_inst::calc_output_layouts(group_correlatio
                                   in_shape[in_rank - 2],  // H — second-to-last
                                   in_shape[in_rank - 1]}; // W — last
 
-    return {layout{out_shape, left_layout.data_type, format::bfzyx}};
+    return {layout{out_shape, left_layout.data_type, format::bzyxf}};
 }
 
 template std::vector<layout> group_correlation_inst::calc_output_layouts<ov::PartialShape>(

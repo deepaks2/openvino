@@ -4,10 +4,12 @@
 
 #include "group_correlation_kernel_selector.hpp"
 #include "group_correlation_kernel_ref.hpp"
+#include "group_correlation_kernel_opt.hpp"
 
 namespace kernel_selector {
 
 group_correlation_kernel_selector::group_correlation_kernel_selector() {
+    Attach<GroupCorrelationKernelOpt>();
     Attach<GroupCorrelationKernelRef>();
 }
 

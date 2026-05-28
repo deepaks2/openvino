@@ -306,6 +306,41 @@ public:
         stages_order.emplace_back(support_opt_kernel(impl_params) ? KernelsTypes::UPDATE_OPT : KernelsTypes::UPDATE_REF);
         return stages_order;
     }
+
+    cldnn::event::ptr execute(const std::vector<cldnn::event::ptr>& events, cldnn::primitive_inst& instance) override {
+        kernel_dump_info.clear_entries();
+
+        cldnn::stream& stream = instance.get_network().get_stream();
+        if (instance.can_be_optimized()) {
+            return stream.aggregate_events(events, events.size() > 1, instance.is_output());
+        }
+
+        // Runtime in-place aliasing disabled: the memory pool may reclaim the
+        // input buffer before downstream consumers finish reading scatter's output,
+        // causing non-deterministic corruption. Additionally, for scatter chains
+        // whose root input derives from a constant, in-place modification corrupts
+        // the constant buffer across inferences. Use standard COPY_ALL + UPDATE.
+        update_rt_params(instance);
+
+        std::vector<size_t> exec_stages;
+        if (!instance.get_network().get_engine().is_the_same_buffer(instance.output_memory(), instance.input_memory())) {
+            exec_stages.emplace_back(KernelsTypes::COPY_ALL);
+        }
+        exec_stages.emplace_back(support_opt_kernel(*instance.get_impl_params()) ? KernelsTypes::UPDATE_OPT : KernelsTypes::UPDATE_REF);
+
+        if (exec_stages.size() == 1) {
+            return execute_stage(events, instance, *_stages[exec_stages[0]]);
+        }
+
+        std::vector<cldnn::event::ptr> tmp_events(events);
+        std::vector<cldnn::event::ptr> all_events;
+        for (const auto& stage_id : exec_stages) {
+            tmp_events = {execute_stage(tmp_events, instance, *_stages[stage_id])};
+            all_events.push_back(tmp_events[0]);
+        }
+
+        return stream.aggregate_events(all_events, true, instance.is_output());
+    };
 };
 
 }  // namespace

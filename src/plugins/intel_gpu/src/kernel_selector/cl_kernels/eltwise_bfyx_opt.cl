@@ -8,6 +8,9 @@
 
 #include "include/batch_headers/fetch_data.cl"
 
+#define VLOAD(offset, ptr)       CAT(vload, VEC_SIZE)(offset, ptr)
+#define VSTORE(val, offset, ptr) CAT(vstore, VEC_SIZE)(val, offset, ptr)
+
 KERNEL(eltwise_bfyx_opt)(
     INPUTS_DECLS
     __global OUTPUT_TYPE* output)
@@ -29,14 +32,14 @@ KERNEL(eltwise_bfyx_opt)(
 
     if (x + VEC_SIZE <= X_SIZE) {
         // Full vector path - use vload for safe unaligned access
-        MAKE_VECTOR_TYPE(INPUT0_TYPE, VEC_SIZE) val0 = vload8(0, input0 + in0_base);
+        MAKE_VECTOR_TYPE(INPUT0_TYPE, VEC_SIZE) val0 = VLOAD(0, input0 + in0_base);
 #if INPUTS_COUNT > 1
-        MAKE_VECTOR_TYPE(INPUT1_TYPE, VEC_SIZE) val1 = vload8(0, input1 + in1_base);
+        MAKE_VECTOR_TYPE(INPUT1_TYPE, VEC_SIZE) val1 = VLOAD(0, input1 + in1_base);
         MAKE_VECTOR_TYPE(OUTPUT_TYPE, VEC_SIZE) res = ELTWISE_OP(val0, val1);
 #else
         MAKE_VECTOR_TYPE(OUTPUT_TYPE, VEC_SIZE) res = val0;
 #endif
-        vstore8(res, 0, output + out_base);
+        VSTORE(res, 0, output + out_base);
     }
 #if X_TAIL > 0
     else if (x < X_SIZE) {

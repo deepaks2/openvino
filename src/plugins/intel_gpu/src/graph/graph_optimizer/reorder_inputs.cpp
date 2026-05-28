@@ -14,6 +14,8 @@
 #include "pooling_inst.h"
 #include "fully_connected_inst.h"
 #include "mvn_inst.h"
+#include "convolution_inst.h"
+#include "scatter_nd_update_inst.h"
 
 #ifdef ENABLE_ONEDNN_FOR_GPU
 #include "gemm_inst.h"
@@ -397,6 +399,133 @@ void minimize_local_reorders(program& p, std::map<program_node*, format::type>& 
 }
 
 
+// When a convolution selects blocked format (b_fs_yx_fsv16) but all downstream
+// consumers (through format-adaptive nodes like crop/slice) ultimately need planar
+// format (bfyx), the resulting reorders can be very expensive. This function detects
+// chains like: conv(b_fs_yx_fsv16) -> slice(b_fs_yx_fsv16) -> reorder -> reshape(bfyx)
+// and switches the conv and its format-adaptive users to bfyx, eliminating reorders.
+void reduce_conv_blocked_to_planar_reorders(program& p, std::map<program_node*, format::type>& fmt_map, layout_optimizer& lo) {
+    for (auto node : p.get_processing_order()) {
+        if (!node->is_in_data_flow())
+            continue;
+        if (!node->is_type<convolution>())
+            continue;
+
+        auto it = fmt_map.find(node);
+        if (it == fmt_map.end())
+            continue;
+
+        auto cur_fmt = it->second;
+        if (cur_fmt != format::b_fs_yx_fsv16)
+            continue;
+
+        auto& users = node->get_users();
+        if (users.empty())
+            continue;
+
+        // Count total downstream reorder elements that would be eliminated.
+        // Check both direct users and 2nd-level users (through format-adaptive nodes).
+        size_t total_reorder_elements = 0;
+        size_t reorder_count = 0;
+        bool all_compatible = true;
+
+        // Collect nodes that should be switched (conv + format-adaptive users)
+        std::vector<program_node*> nodes_to_switch;
+        nodes_to_switch.push_back(node);
+
+        for (auto user : users) {
+            if (!user->is_in_data_flow())
+                continue;
+
+            auto user_it = fmt_map.find(user);
+            if (user_it == fmt_map.end()) {
+                all_compatible = false;
+                break;
+            }
+
+            auto user_fmt = user_it->second;
+
+            // If user already needs bfyx, it's a direct reorder we'd eliminate
+            if (user_fmt == format::bfyx) {
+                auto l = node->get_output_layout();
+                if (l.is_static()) {
+                    total_reorder_elements += l.count();
+                    reorder_count++;
+                }
+                continue;
+            }
+
+            // If user has same blocked format (propagated from conv) and is
+            // a format-adaptive node (crop/strided_slice/reshape-like), check its users
+            if (user_fmt == cur_fmt) {
+                bool user_downstream_needs_planar = true;
+                for (auto user2 : user->get_users()) {
+                    if (!user2->is_in_data_flow())
+                        continue;
+                    auto user2_it = fmt_map.find(user2);
+                    if (user2_it == fmt_map.end()) {
+                        user_downstream_needs_planar = false;
+                        break;
+                    }
+                    auto user2_fmt = user2_it->second;
+                    if (user2_fmt != format::bfyx && user2_fmt != format::any &&
+                        user2_fmt != format::bfzyx) {
+                        // bfzyx is OK because bfyx->bfzyx is a trivial reshape, not blocked conversion
+                        user_downstream_needs_planar = false;
+                        break;
+                    }
+                    if (user2_fmt == format::bfyx || user2_fmt == format::bfzyx) {
+                        auto l = user->get_output_layout();
+                        if (l.is_static()) {
+                            total_reorder_elements += l.count();
+                            reorder_count++;
+                        }
+                    }
+                }
+                if (!user_downstream_needs_planar) {
+                    all_compatible = false;
+                    break;
+                }
+                // This user can be switched to bfyx too
+                if (lo.is_format_supported(*user, format::bfyx)) {
+                    nodes_to_switch.push_back(user);
+                }
+                continue;
+            }
+
+            // User has format::any - it will adapt, no issue
+            if (user_fmt == format::any)
+                continue;
+
+            // User has some other blocked format - not safe to switch
+            all_compatible = false;
+            break;
+        }
+
+        if (!all_compatible)
+            continue;
+
+        // Require significant reorder savings (at least 4 reorders and >100K elements)
+        if (reorder_count < 4 || total_reorder_elements < 100000)
+            continue;
+
+        // Check that the convolution supports bfyx output
+        if (!lo.is_format_supported(*node, format::bfyx))
+            continue;
+
+        // Switch format to bfyx for conv and all compatible intermediate nodes
+        for (auto* n : nodes_to_switch) {
+            fmt_map[n] = format::bfyx;
+        }
+
+        GPU_DEBUG_LOG << "reduce_conv_blocked_to_planar_reorders: " << node->id()
+                      << " switched from b_fs_yx_fsv16 to bfyx (+"
+                      << nodes_to_switch.size() - 1 << " users)"
+                      << " eliminating ~" << reorder_count << " reorders"
+                      << " (" << total_reorder_elements << " elements)" << std::endl;
+    }
+}
+
 const char *dir_msg(direction_e dir) {
     if (dir == direction_e::forwards)
         return "forward";
@@ -533,7 +662,44 @@ void reorder_inputs::run(program& p, reorder_factory& rf) {
     }
 
     propagate_formats(p, fmt_map, lo);
+
+    // Eliminate unnecessary planar-to-planar reorders before oneDNN convolutions.
+    // When a scatter_nd_update (which can only output default planar format) feeds an
+    // oneDNN conv whose preferred_input_fmt is a different non-blocked format (e.g. bzyxf),
+    // override the conv's preferred input to match the scatter's output. oneDNN handles
+    // the internal format negotiation efficiently, avoiding an expensive explicit reorder.
+    for (auto n : p.get_processing_order()) {
+        if (!n->is_in_data_flow())
+            continue;
+        if (!n->is_type<convolution>())
+            continue;
+        if (n->get_preferred_impl_type() != impl_types::onednn)
+            continue;
+
+        auto input_pref = n->get_preferred_input_fmt(0);
+        if (input_pref == format::any || format::is_blocked(input_pref))
+            continue;
+
+        auto& dep = n->get_dependency(0);
+        if (!dep.is_type<scatter_nd_update>())
+            continue;
+
+        auto dep_out_fmt = dep.get_output_layout().format;
+        if (dep_out_fmt == format::any || format::is_blocked(dep_out_fmt))
+            continue;
+        if (format::dimension(dep_out_fmt) != format::dimension(input_pref))
+            continue;
+        if (dep_out_fmt == input_pref)
+            continue;
+
+        GPU_DEBUG_LOG_PASS << "  Override conv " << n->id() << " preferred_input_fmt from "
+                           << fmt_to_str(input_pref) << " to " << fmt_to_str(dep_out_fmt)
+                           << " (scatter_nd_update producer)" << std::endl;
+        n->set_preferred_input_fmt(0, dep_out_fmt);
+    }
+
     minimize_local_reorders(p, fmt_map, lo);
+    reduce_conv_blocked_to_planar_reorders(p, fmt_map, lo);
 
     GPU_DEBUG_LOG_PASS << "Selected formats:" << std::endl;
     for (auto node_ptr : p.get_processing_order()) {

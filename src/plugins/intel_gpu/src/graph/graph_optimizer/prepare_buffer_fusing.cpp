@@ -148,9 +148,20 @@ bool concat_in_place_optimization::match(const program_node& concat_node,
         // TODO: handle optimized reshape
         if (pred.first->is_type<reshape>() && pred.first->can_be_optimized())
             return false;
-        // TODO: Investigate if this condition is needed
-        if (pred.first->get_users().size() > 2)
-            return false;
+        // For static predecessors, allow >2 users as long as all non-concat users
+        // are read-only consumers (not output/assign/mutable ops that could write the buffer).
+        // The existing concat_users==1 check below ensures no conflicting padding from multiple concats.
+        if (pred.first->get_users().size() > 2) {
+            if (pred.first->is_dynamic())
+                return false;
+            for (const auto& user : pred.first->get_users()) {
+                if (user->is_type<concatenation>())
+                    continue;
+                // Reject if any non-concat user is an output, assign, or read_value (stateful ops)
+                if (user->is_output() || user->is_type<assign>() || user->is_type<read_value>())
+                    return false;
+            }
+        }
 
        // Check that input isn't optimized out concatenation along different axis.
         if (pred.first->is_type<concatenation>() && pred.first->can_be_optimized()) {
@@ -170,8 +181,13 @@ bool concat_in_place_optimization::match(const program_node& concat_node,
                 concat_users += 1;
 
         // If input is used by more than one concatenation then they may require different paddings.
-        if (concat_users != 1)
-            return false;
+        // For static shapes, allow multiple concat users since the existing padding checks (below)
+        // will naturally reject the second concat that tries to optimize the same predecessor.
+        // Only one concat can win the in-place slot for a given predecessor.
+        if (concat_users != 1) {
+            if (concat_node.is_dynamic() || pred.first->is_dynamic())
+                return false;
+        }
 
         const layout& pred_l = pred_params[idx].get_output_layout();
         if (output_format != pred_l.format || output_datatype != pred_l.data_type)

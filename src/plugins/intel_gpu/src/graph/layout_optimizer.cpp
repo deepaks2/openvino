@@ -298,8 +298,8 @@ bool layout_optimizer::can_fuse_reorder(program_node& prev, program_node& next, 
         // Errata for onednn layout selection. First conv can receive both bfyx and byxf directly.
         if (next.get_preferred_impl_type() == impl_types::onednn &&
             ((fmt_prev == format::byxf && fmt_next == format::byxf) ||
-             (fmt_prev == format::bfyx && fmt_next == format::byxf &&
-                (prev_dt == data_types::f16 && get_convolution_channel_count(conv_node, next.get_input_layout(0), false) <= 8))) &&
+            (fmt_prev == format::bfyx && fmt_next == format::byxf &&
+               (prev_dt == data_types::f16 && get_convolution_channel_count(conv_node, next.get_input_layout(0), false) <= 8))) &&
             is_input_reorder(prev, next))
             return true;
 
@@ -1503,6 +1503,23 @@ format layout_optimizer::get_preferred_format(program_node& node) {
         if (node.as<dft>().get_primitive()->mode == dft_mode::real &&
             node.as<dft>().get_primitive()->direction == dft_direction::forward) {
             node.set_preferred_input_fmt(0, format::get_default_format(node.get_input_layouts()[0].get_rank()));
+        }
+    } else if (node.is_type<scatter_nd_update>()) {
+        // For scatter_nd_update with a single consumer that has a preferred input format,
+        // set the scatter's preferred input formats to default planar to avoid unnecessary
+        // input reorders during format propagation. The scatter kernel uses indexed access
+        // and handles any input/output format combination.
+        if (!node.is_dynamic() && node.get_users().size() == 1 && node.get_fused_primitives().empty()) {
+            auto* user = node.get_users().front();
+            auto dep_idx = user->get_dependency_index(node);
+            auto user_preferred_input = user->get_preferred_input_fmt(dep_idx);
+            if (user_preferred_input != format::any) {
+                auto out_rank = node.get_output_layout().get_rank();
+                auto default_fmt = format::get_default_format(out_rank);
+                for (size_t i = 0; i < node.get_dependencies().size(); i++) {
+                    node.set_preferred_input_fmt(i, default_fmt);
+                }
+            }
         }
     }
 

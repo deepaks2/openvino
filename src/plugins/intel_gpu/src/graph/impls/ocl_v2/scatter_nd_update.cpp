@@ -340,7 +340,7 @@ public:
         }
 
         return stream.aggregate_events(all_events, true, instance.is_output());
-    };
+    }
 };
 
 }  // namespace

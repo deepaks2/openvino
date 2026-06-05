@@ -91,14 +91,27 @@ UnsqueezeBroadcastReshapeSDPAFusion::UnsqueezeBroadcastReshapeSDPAFusion() {
         auto get_input_shape = [](const std::shared_ptr<ov::op::v3::Broadcast>& broadcast) -> std::vector<int32_t> {
             if (!broadcast) return {};
             auto input_node = broadcast->get_input_node_shared_ptr(0);
-            if (input_node && input_node->get_output_partial_shape(0).is_static()) {
-                auto pshape = input_node->get_output_shape(0);
-                std::vector<int32_t> result(pshape.size());
-                std::transform(pshape.begin(), pshape.end(), result.begin(),
+            if (!input_node) return {};
+            auto pshape = input_node->get_output_partial_shape(0);
+            if (pshape.is_static()) {
+                auto static_shape = input_node->get_output_shape(0);
+                std::vector<int32_t> result(static_shape.size());
+                std::transform(static_shape.begin(), static_shape.end(), result.begin(),
                                [](size_t v) { return static_cast<int32_t>(v); });
                 return result;
             }
-            return {};
+            // Partially dynamic: return known dims and -1 for unknowns so callers can
+            // still reason about broadcast patterns when the batch dimension is dynamic.
+            if (pshape.is_dynamic()) {
+                std::vector<int32_t> result;
+                result.reserve(pshape.size());
+                for (const auto& dim : pshape) {
+                    result.push_back(dim.is_static() ? static_cast<int32_t>(dim.get_length()) : -1);
+                }
+                return result;
+            }
+            // Fully dynamic.
+            return std::vector<int32_t>(pshape.size(), -1);
         };
 
         auto valid_broadcast_target_shape = [](const std::vector<int32_t>& input_shape,
@@ -113,8 +126,14 @@ UnsqueezeBroadcastReshapeSDPAFusion::UnsqueezeBroadcastReshapeSDPAFusion() {
                 }
                 return diff_cnt == 1;
             } else {
-                // For dynamic output shapes, check the target_shape pattern
-                return std::count_if(target_shape.begin(), target_shape.end(), [](int32_t s) { return s != 1; }) == 1;
+                // For dynamic output shapes, check the target_shape pattern.
+                // For dynamic batch models the batch dim may itself be dynamic so we
+                // allow wider patterns where at most one dimension is > 1 (or unknown).
+                int non_one_count = 0;
+                for (int32_t s : target_shape) {
+                    if (s > 1) ++non_one_count;
+                }
+                return non_one_count <= 1;
             }
         };
 

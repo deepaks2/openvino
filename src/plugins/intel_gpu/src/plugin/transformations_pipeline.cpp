@@ -671,7 +671,35 @@ void TransformationsPipeline::apply(std::shared_ptr<ov::Model> func) {
         pass_config->set_callback<DisableFP16ComSinGenPatternForHiFiGAN>(
             [](const_node_ptr& node) -> bool { return ov::fp16_compression_is_disabled(node); });
         manager.register_pass<DisableFP16ComSinGenPatternForHiFiGAN>();
-        const bool keep_precision_sensitive_in_fp32_1 = true;
+        // When the model is already predominantly f16 (explicitly exported as f16),
+        // do not keep precision-sensitive subgraphs in f32. GPU kernels (RMS, MVN, Softmax)
+        // already use f32 internal accumulation for numerical stability, so f16 I/O is safe.
+        // This prevents MarkSubgraphsToKeepInMixedPrecision from promoting residual chains
+        // to f32 through weight decompression Convert nodes in f16 models.
+        bool keep_precision_sensitive_in_fp32_1 = true;
+        if (infer_precision == ov::element::f16) {
+            size_t f16_params = 0, total_params = 0;
+            for (const auto& param : func->get_parameters()) {
+                total_params++;
+                if (param->get_element_type() == ov::element::f16)
+                    f16_params++;
+            }
+            size_t f16_consts = 0, total_consts = 0;
+            for (const auto& op : func->get_ordered_ops()) {
+                if (ov::is_type<ov::op::v0::Constant>(op)) {
+                    auto ct = op->get_element_type();
+                    if (ct == ov::element::f16 || ct == ov::element::f32) {
+                        total_consts++;
+                        if (ct == ov::element::f16)
+                            f16_consts++;
+                    }
+                }
+            }
+            // If >50% of FP constants are already f16, the model was exported as f16
+            if (total_consts > 0 && f16_consts * 2 > total_consts) {
+                keep_precision_sensitive_in_fp32_1 = false;
+            }
+        }
         const bool convert_input_output_precision = false;
         const bool store_original_precision_as_rt_attribute = true;
         const auto add_precision_sensitive_convert = true;

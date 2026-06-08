@@ -6,6 +6,7 @@
 #include "intel_gpu/op/placeholder.hpp"
 #include "convert_matmul_to_fc.hpp"
 #include "openvino/op/matmul.hpp"
+#include "openvino/op/add.hpp"
 #include "openvino/op/convert.hpp"
 #include "openvino/op/transpose.hpp"
 #include "openvino/op/reshape.hpp"
@@ -53,6 +54,15 @@ ConvertMatMulToFullyConnected::ConvertMatMulToFullyConnected(bool supports_immad
 
         auto fc_input_a = pattern_map.at(activations_m);
         auto fc_input_b = pattern_map.at(weights_m);
+
+        bool has_bias = false;
+        for (const auto& target_input : matmul->output(0).get_target_inputs()) {
+            auto consumer = target_input.get_node()->shared_from_this();
+            if (auto add = ov::as_type_ptr<ov::op::v1::Add>(consumer)) {
+                if (ov::is_type<ov::op::v0::Constant>(add->get_input_node_shared_ptr(1)))
+                    has_bias = true;
+            }
+        }
 
         // If 'fc_input_b' is shared with another matmul, transposing 'fc_input_b' is restricted.
         // If it is connected to the 'input_a' of another matmul, do not transpose
@@ -175,23 +185,87 @@ ConvertMatMulToFullyConnected::ConvertMatMulToFullyConnected(bool supports_immad
         }
 
         // Weights normalization
-        bool can_reuse_transpose = false;
-        if (!matmul->get_transpose_b()) {
-            if (transpose_node && transpose_node->get_input_size() == 2) {
-                auto order_constant = ov::as_type_ptr<ov::op::v0::Constant>(transpose_node->get_input_node_shared_ptr(1));
-                if (order_constant) {
-                    std::vector<size_t> order = order_constant->cast_vector<size_t>();
-
-                    std::vector<size_t> expected_order(fc_input_b.get_partial_shape().size());
-                    std::iota(expected_order.begin(), expected_order.end(), 0);
-                    std::swap(*(expected_order.end() - 1), *(expected_order.end() - 2));
-
-                    can_reuse_transpose = order == expected_order;
-                }
+        bool is_small_matmul = true;
+        if (shape_a.is_static() && shape_b.is_static()) {
+            auto output_shape = matmul->get_output_shape(0);
+            size_t k = 0;
+            if (matmul->get_transpose_a())
+                k = shape_a[shape_a.rank().get_length() - 2].get_length();
+            else
+                k = shape_a[shape_a.rank().get_length() - 1].get_length();
+            uint64_t total_ops = (uint64_t)ov::shape_size(output_shape) * k;
+            if ((total_ops >> 20) >= 64 && matmul->get_input_element_type(0) == ov::element::f16 && !is_compressed_weight) {
+                if (shape_b[shape_b.rank().get_length() - 2].get_length() < shape_b[shape_b.rank().get_length() - 1].get_length())
+                    is_small_matmul = false;
             }
+        }
 
-            fc_input_b = can_reuse_transpose ? transpose_node
-                                             : create_transpose(fc_input_b, matmul->get_friendly_name() + "/transpose_b");
+        if (has_bias)
+            is_small_matmul = true;
+
+        if (is_small_matmul) {
+            if (!matmul->get_transpose_b()) {
+                if (transpose_node && transpose_node->get_input_size() == 2) {
+                    auto order_constant = ov::as_type_ptr<ov::op::v0::Constant>(transpose_node->get_input_node_shared_ptr(1));
+                    if (order_constant) {
+                        std::vector<size_t> order = order_constant->cast_vector<size_t>();
+
+                        std::vector<size_t> expected_order(fc_input_b.get_partial_shape().size());
+                        std::iota(expected_order.begin(), expected_order.end(), 0);
+                        std::swap(*(expected_order.end() - 1), *(expected_order.end() - 2));
+
+                        if (order == expected_order) {
+                            // fc_input_b was [N, K], transposed to [K, N] (input to matmul).
+                            // We peeled transpose, so fc_input_b is [N, K].
+                            // We want [N, K]. So good.
+                        } else {
+                            fc_input_b = create_transpose(fc_input_b, matmul->get_friendly_name() + "/transpose_b");
+                        }
+                    } else {
+                        fc_input_b = create_transpose(fc_input_b, matmul->get_friendly_name() + "/transpose_b");
+                    }
+                } else {
+                    fc_input_b = create_transpose(fc_input_b, matmul->get_friendly_name() + "/transpose_b");
+                 }
+            } else {
+                 // transpose_b=true. Input [N, K].
+                 // We want [N, K].
+                 if (transpose_node && transpose_node->get_input_size() == 2) {
+                    auto order_constant = ov::as_type_ptr<ov::op::v0::Constant>(transpose_node->get_input_node_shared_ptr(1));
+                     if (order_constant) {
+                        std::vector<size_t> order = order_constant->cast_vector<size_t>();
+
+                        std::vector<size_t> expected_order(fc_input_b.get_partial_shape().size());
+                        std::iota(expected_order.begin(), expected_order.end(), 0);
+                        std::swap(*(expected_order.end() - 1), *(expected_order.end() - 2));
+
+                        if (order == expected_order) {
+                            // fc_input_b was [K, N], transposed to [N, K] (input to matmul).
+                            // We peeled, so fc_input_b is [K, N].
+                            // We want [N, K]. So restore transpose.
+                            fc_input_b = transpose_node;
+                        }
+                    }
+                 }
+            }
+        } else {
+            if (!matmul->get_transpose_b()) {
+                if (transpose_node && transpose_node->get_input_size() == 2) {
+                    auto order_constant = ov::as_type_ptr<ov::op::v0::Constant>(transpose_node->get_input_node_shared_ptr(1));
+                    if (order_constant) {
+                        std::vector<size_t> order = order_constant->cast_vector<size_t>();
+
+                        std::vector<size_t> expected_order(fc_input_b.get_partial_shape().size());
+                        std::iota(expected_order.begin(), expected_order.end(), 0);
+                        std::swap(*(expected_order.end() - 1), *(expected_order.end() - 2));
+
+                        if (order == expected_order)
+                            fc_input_b = transpose_node;
+                    }
+                }
+            } else {
+                fc_input_b = create_transpose(fc_input_b, matmul->get_friendly_name() + "/transpose_b");
+            }
         }
 
         // Input normalization
@@ -200,7 +274,14 @@ ConvertMatMulToFullyConnected::ConvertMatMulToFullyConnected(bool supports_immad
         }
 
         // Connect Convert to new input if needed
-        if (is_convert) {
+        if (is_convert && transpose_node && fc_input_b.get_node_shared_ptr() != transpose_node) {
+            auto convert = pattern_map.at(weights_m).get_node_shared_ptr();
+            auto new_convert = convert->clone_with_new_inputs({fc_input_b});
+            new_ops.push_back(new_convert);
+            new_convert->validate_and_infer_types();
+            fc_input_b = new_convert;
+        } else if (is_convert) {
+            // No new transpose was generated, but we still need to rewire the Convert
             auto convert = pattern_map.at(weights_m).get_node_shared_ptr();
             auto new_convert = convert->clone_with_new_inputs({fc_input_b});
             new_ops.push_back(new_convert);
@@ -211,7 +292,7 @@ ConvertMatMulToFullyConnected::ConvertMatMulToFullyConnected(bool supports_immad
         auto no_bias = std::make_shared<op::Placeholder>();
 
         // Create FullyConnected
-        auto fc = std::make_shared<op::FullyConnected>(fc_input_a, fc_input_b, no_bias, matmul->get_output_element_type(0));
+        auto fc = std::make_shared<op::FullyConnected>(fc_input_a, fc_input_b, no_bias, matmul->get_output_element_type(0), is_small_matmul);
         fc->set_friendly_name(matmul->get_friendly_name());
         new_ops.push_back(fc);
         ov::copy_runtime_info(matmul, new_ops);

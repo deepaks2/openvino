@@ -1636,7 +1636,14 @@ void program_node::create_onednn_primitive_attributes(
                         new_layout.set_partial_shape(new_input_pshape);
                         in = new_layout;
                     }
-                    dnnl::memory::dims dims = onednn::convert_tensor(in.get_tensor(), rank, false);
+                    // Fix: when GEMM output rank < binary source rank (e.g., 3D source
+                    // with 2D GEMM output), flatten the source to match output rank so
+                    // append_binary() derives a valid mask. Without this, a 3D binary
+                    // source could produce mask=6 on a 2D output (ab), which is invalid.
+                    size_t target_rank = rank;
+                    if (out_pshape.size() > 0 && out_pshape.size() < in_pshape.size())
+                        target_rank = out_pshape.size();
+                    dnnl::memory::dims dims = onednn::convert_tensor(in.get_tensor(), target_rank, false);
                     dnnl::memory::data_type dt = onednn::convert_data_type(in.data_type);
                     dnnl::memory::format_tag fmt = onednn::convert_gemm_data_format(dims, in.format);
                     post_ops.append_binary(alg, dnnl::memory::desc(dims, dt, fmt));
@@ -1651,6 +1658,23 @@ void program_node::create_onednn_primitive_attributes(
 
                     dnnl::memory::data_type dt = onednn::convert_data_type(in.data_type);
                     dnnl::memory::format_tag fmt = onednn::convert_gemm_data_format(dims, in.format);
+
+                    // Fix for 3D FC binary post-op mask: match output rank.
+                    // FC with input_size > 2 produces 4D output (bfyx), but the binary
+                    // source (e.g., residual) may still be 3D. Pad with leading 1s to
+                    // match output rank so append_binary() derives the correct mask.
+                    // This is memory-safe because the new leading dim(s) are size 1.
+                    if (input_size > 2 && dims.size() < get_output_layout().get_partial_shape().size()) {
+                        auto out_rank = get_output_layout().get_partial_shape().size();
+                        dnnl::memory::dims padded;
+                        padded.reserve(out_rank);
+                        for (size_t i = 0; i < out_rank - dims.size(); i++)
+                            padded.push_back(1);
+                        padded.insert(padded.end(), dims.begin(), dims.end());
+                        dims = padded;
+                        fmt = onednn::convert_data_format(get_output_layout().format);
+                    }
+
                     post_ops.append_binary(alg, dnnl::memory::desc(dims, dt, fmt));
                     update_onednn_post_op_list(op_type, dep_idx, fmt, false, dims, dt);
                 } else if (is_type<reduce>()) {

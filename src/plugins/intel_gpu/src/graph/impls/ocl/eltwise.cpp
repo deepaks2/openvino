@@ -67,10 +67,36 @@ public:
         params.coefficients = primitive->coefficients;
 
         // WA to always match compiled dynamic kernel with dispatch data
-        // W/O enforcing this option we may generate kernel for "broadcast" scneario due to umatched tensor dimensions
+        // W/O enforcing this option we may generate kernel for "broadcast" scenario due to unmatched tensor dimensions
         // but in runtime dispatch data will be generated for non-broadcast case as shapes are actually same.
+        // Optimization: skip forced broadcast when we can prove from partial shapes that no broadcasting
+        // will occur at runtime. This requires: same rank, no static-1 vs non-1 dimension mismatches,
+        // and all static dimensions must match exactly.
         if (impl_param.get_program().get_node(primitive->id).is_dynamic()) {
-            params.broadcast = true;
+            bool needs_broadcast = false;
+            const auto& out_pshape = impl_param.get_output_layout().get_partial_shape();
+            for (size_t i = 0; i < inputs_count && !needs_broadcast; i++) {
+                const auto& in_pshape = impl_param.input_layouts[i].get_partial_shape();
+                if (in_pshape.rank() != out_pshape.rank()) {
+                    needs_broadcast = true;
+                    break;
+                }
+                for (size_t d = 0; d < static_cast<size_t>(in_pshape.size()); d++) {
+                    // If input dim is statically 1 and output dim is not statically 1, it's broadcast
+                    if (in_pshape[d].is_static() && in_pshape[d].get_length() == 1 &&
+                        !(out_pshape[d].is_static() && out_pshape[d].get_length() == 1)) {
+                        needs_broadcast = true;
+                        break;
+                    }
+                    // If both are static but different values, it's a shape mismatch (broadcast or error)
+                    if (in_pshape[d].is_static() && out_pshape[d].is_static() &&
+                        in_pshape[d].get_length() != out_pshape[d].get_length()) {
+                        needs_broadcast = true;
+                        break;
+                    }
+                }
+            }
+            params.broadcast = needs_broadcast;
         } else {
             for (size_t i = 0; i < params.inputs.size(); i++) {
                 if (!params.inputs[i].SameDims(params.outputs[0])) {

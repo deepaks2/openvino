@@ -70,10 +70,12 @@ bool EltwiseKernel_vload8::Validate(const Params& params) const {
 
     bool bCheckSizes = true;
     for (size_t i = 0; i < ewParams.inputs.size(); i++) {
-        // allow only the same input sizes or scalars, without pitches
-        if (ewParams.inputs[i].PitchesDifferFromLogicalDims() ||
-            (!(ewParams.inputs[0] == ewParams.inputs[i] && ewParams.inputs[i] == ewParams.outputs[0]) &&
-             ewParams.inputs[i].PhysicalSize() != 1))
+        // allow same logical dimensions even with pitched layouts (residual adds with alignment padding,
+        // or SwiGLU gate*up where two FC outputs share logical shape but differ in physical padding)
+        bool same_logical_dims = (ewParams.inputs[0].SameDims(ewParams.inputs[i]) && ewParams.inputs[i].SameDims(ewParams.outputs[0]));
+        if (ewParams.inputs[i].PitchesDifferFromLogicalDims() && !same_logical_dims)
+            bCheckSizes = false;
+        if (!same_logical_dims && ewParams.inputs[i].PhysicalSize() != 1)
             bCheckSizes = false;
     }
 

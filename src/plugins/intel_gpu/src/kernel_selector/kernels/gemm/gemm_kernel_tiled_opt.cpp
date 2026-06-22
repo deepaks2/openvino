@@ -98,7 +98,7 @@ GemmKernelTiledOpt::GemmTuningData GemmKernelTiledOpt::SetTuningParams(const gem
         // Increasing tile_n_size has performance improvement when m_size and n_size are not shallow and n_size is aligned at 32.
         // TODO: Support TILE_K_LEFTOVER true case at static shape
         if (m_size >= 128 && n_size >= 128 && (n_size % 32 == 0) && tuning_data.simd_size == 16 &&
-            (k_size % tuning_data.tile_k_size == 0) && params.fused_ops.empty())
+            (k_size % tuning_data.tile_k_size == 0))
             tuning_data.tile_n_size = 32;
 
         GPU_DEBUG_LOG << params.layerID << ": m_size: " << m_size << ", n_size: " << n_size << ", k_size: " << k_size << std::endl;

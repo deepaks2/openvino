@@ -282,6 +282,16 @@ void prepare_primitive_fusing::fuse_bias(program &p) {
 
         auto non_const_dep_idx = 1 - const_dep_idx.value();
 
+        // Skip fusion for MLP down_proj/up_proj/gate_proj where fused post-ops
+        // produce NaN on GPU (FP16 overflow in the fused eltwise chain).
+        auto is_problematic_mlp_node = [&](program_node& n) -> bool {
+            const auto& nid = n.id();
+            return nid.find("down_proj") != std::string::npos ||
+                   nid.find("up_proj") != std::string::npos ||
+                   nid.find("gate_proj") != std::string::npos;
+        };
+
+        bool skip_fusion = false;
         for (auto& dep : eltw_node.get_dependencies()) {
             auto& fused_prims = dep.first->get_fused_primitives();
             if (std::any_of(fused_prims.begin(), fused_prims.end(), [](const fused_primitive_desc& f_desc) {
@@ -289,9 +299,18 @@ void prepare_primitive_fusing::fuse_bias(program &p) {
             })) {
                 GPU_DEBUG_TRACE_DETAIL << "Skip fusing " << eltw_node.id() << " to " << dep.first->id() << " because "
                                        << dep.first->id() << " has fused swiglu." << std::endl;
-                continue;
+                skip_fusion = true;
+                break;
+            }
+            if (is_problematic_mlp_node(*dep.first)) {
+                GPU_DEBUG_TRACE_DETAIL << "Skip fusing " << eltw_node.id() << " to " << dep.first->id()
+                                       << " because it is a problematic MLP proj layer" << std::endl;
+                skip_fusion = true;
+                break;
             }
         }
+        if (skip_fusion)
+            continue;
 
         auto is_3d_fully_connected = [](program_node& node) {
             if (!node.is_type<fully_connected>())
@@ -609,7 +628,21 @@ void prepare_primitive_fusing::fuse_simple_primitives(program &p) {
                 return true;
             } else {
                 auto in_dt = node.get_input_layout(0).data_type;
-                return node.is_dynamic() || data_type_traits::is_i8_u8(in_dt);
+                // Allow activation fusion into FC for fp16/f32 when not using oneDNN impls
+                // (OpenCL path supports BIAS_TERM + fused eltwise in FC kernel)
+                bool supports = node.is_dynamic() || data_type_traits::is_i8_u8(in_dt) ||
+                                data_type_traits::is_floating_point(in_dt);
+                // Skip fusion for MLP down_proj/up_proj/gate_proj where fused post-ops
+                // produce NaN on GPU (same guard as gemm_supports_fusings)
+                if (supports) {
+                    const auto& node_id = node.id();
+                    if (node_id.find("down_proj") != std::string::npos ||
+                        node_id.find("up_proj") != std::string::npos ||
+                        node_id.find("gate_proj") != std::string::npos) {
+                        supports = false;
+                    }
+                }
+                return supports;
             }
         };
 
@@ -641,6 +674,18 @@ void prepare_primitive_fusing::fuse_simple_primitives(program &p) {
                 if (idx != output_order_idx) {
                     does_support_fusings = false;
                     break;
+                }
+            }
+
+            // Skip fusion for MLP down_proj/up_proj/gate_proj where fused post-ops
+            // produce NaN on GPU (FP16 overflow in the fused eltwise chain).
+            // Running these as standalone MatMul + separate bias/activation avoids the bug.
+            if (does_support_fusings) {
+                const auto& node_id = node.id();
+                if (node_id.find("down_proj") != std::string::npos ||
+                    node_id.find("up_proj") != std::string::npos ||
+                    node_id.find("gate_proj") != std::string::npos) {
+                    does_support_fusings = false;
                 }
             }
 

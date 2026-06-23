@@ -291,6 +291,26 @@ void prepare_primitive_fusing::fuse_bias(program &p) {
                    nid.find("gate_proj") != std::string::npos;
         };
 
+        // Also skip fusion for residual adds that combine an RMS norm output with a
+        // non-constant skip connection (the FP16 overflow path in post-ffw-norm).
+        auto is_residual_add_after_rms = [&](program_node& n) -> bool {
+            if (!n.is_type<eltwise>())
+                return false;
+            auto& eltw = n.as<eltwise>();
+            if (eltw.get_primitive()->mode != eltwise_mode::sum)
+                return false;
+            bool has_rms_dep = false;
+            bool has_non_const_dep = false;
+            for (auto& dep : eltw.get_dependencies()) {
+                const auto& dep_id = dep.first->id();
+                if (dep_id.find("rms:") == 0)
+                    has_rms_dep = true;
+                else if (!dep.first->is_constant())
+                    has_non_const_dep = true;
+            }
+            return has_rms_dep && has_non_const_dep;
+        };
+
         bool skip_fusion = false;
         for (auto& dep : eltw_node.get_dependencies()) {
             auto& fused_prims = dep.first->get_fused_primitives();
@@ -308,6 +328,10 @@ void prepare_primitive_fusing::fuse_bias(program &p) {
                 skip_fusion = true;
                 break;
             }
+        }
+        if (!skip_fusion && is_residual_add_after_rms(*node)) {
+            GPU_DEBUG_TRACE_DETAIL << "Skip fusing residual add after RMS: " << node->id() << std::endl;
+            skip_fusion = true;
         }
         if (skip_fusion)
             continue;
@@ -634,13 +658,14 @@ void prepare_primitive_fusing::fuse_simple_primitives(program &p) {
                                 data_type_traits::is_floating_point(in_dt);
                 // Skip fusion for MLP down_proj/up_proj/gate_proj where fused post-ops
                 // produce NaN on GPU (same guard as gemm_supports_fusings)
+                bool mlp_match = false;
                 if (supports) {
                     const auto& node_id = node.id();
-                    if (node_id.find("down_proj") != std::string::npos ||
-                        node_id.find("up_proj") != std::string::npos ||
-                        node_id.find("gate_proj") != std::string::npos) {
+                    mlp_match = node_id.find("down_proj") != std::string::npos ||
+                                 node_id.find("up_proj") != std::string::npos ||
+                                 node_id.find("gate_proj") != std::string::npos;
+                    if (mlp_match)
                         supports = false;
-                    }
                 }
                 return supports;
             }
@@ -680,13 +705,14 @@ void prepare_primitive_fusing::fuse_simple_primitives(program &p) {
             // Skip fusion for MLP down_proj/up_proj/gate_proj where fused post-ops
             // produce NaN on GPU (FP16 overflow in the fused eltwise chain).
             // Running these as standalone MatMul + separate bias/activation avoids the bug.
+            bool gemm_match = false;
             if (does_support_fusings) {
                 const auto& node_id = node.id();
-                if (node_id.find("down_proj") != std::string::npos ||
-                    node_id.find("up_proj") != std::string::npos ||
-                    node_id.find("gate_proj") != std::string::npos) {
+                gemm_match = node_id.find("down_proj") != std::string::npos ||
+                             node_id.find("up_proj") != std::string::npos ||
+                             node_id.find("gate_proj") != std::string::npos;
+                if (gemm_match)
                     does_support_fusings = false;
-                }
             }
 
             return does_support_fusings;
